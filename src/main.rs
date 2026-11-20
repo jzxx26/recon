@@ -40,6 +40,40 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str, note: &str) {
     });
 }
 
+fn breakdown_panel(ui: &mut egui::Ui, matches: &[&Match], by_agent: bool) {
+    let mut groups = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
+    for m in matches {
+        let name = if by_agent { &m.agent } else { &m.map };
+        let entry = groups.entry(name.clone()).or_default();
+        entry.0 += 1;
+        if m.won.is_some() { entry.1 += 1; }
+        if m.won == Some(true) { entry.2 += 1; }
+    }
+    let mut ordered: Vec<_> = groups.into_iter().collect();
+    ordered.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    egui::Frame::new().fill(PANEL).corner_radius(9.0)
+        .inner_margin(egui::Margin::same(17)).show(ui, |ui| {
+            ui.set_min_width(300.0);
+            ui.label(RichText::new(if by_agent { "AGENT PERFORMANCE" } else { "MAP PERFORMANCE" }).color(WHITE).strong().size(14.0));
+            ui.label(RichText::new("Sorted by matches played").color(MUTED).size(11.0));
+            ui.add_space(12.0);
+            for (label, (played, decided, wins)) in ordered {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&label).color(WHITE).size(13.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(if decided > 0 {
+                            format!("{:.0}% WR", 100.0 * wins as f64 / decided as f64)
+                        } else { "N/A".into() }).color(if decided > 0 { GREEN } else { MUTED }).size(12.0));
+                    });
+                });
+                let ratio = if decided > 0 { wins as f32 / decided as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(ratio).desired_width(ui.available_width()).fill(GREEN));
+                ui.label(RichText::new(format!("{played} played · {wins} wins · {decided} decided")).color(MUTED).size(10.0));
+                ui.add_space(10.0);
+            }
+        });
+}
+
 fn is_round_mode(mode: &str) -> bool {
     !mode.to_ascii_lowercase().contains("deathmatch")
 }
@@ -728,33 +762,36 @@ impl Recon {
     }
 
     fn analytics_ui(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "Analytics", "Agent and map breakdowns from cached round-based matches");
+        heading(ui, "Analytics", "Agent and map performance across cached round-based matches");
         let supported: Vec<&Match> = self.matches.iter().filter(|m| is_round_mode(&m.mode)).collect();
-        if supported.is_empty() { ui.label("No supported matches to analyze yet."); return; }
-        for (title, by_agent) in [("AGENT PERFORMANCE", true), ("MAP PERFORMANCE", false)] {
-            egui::Frame::new().fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
-                ui.label(RichText::new(title).color(WHITE).strong());
-                let mut keys: Vec<String> = supported.iter().map(|m| if by_agent { m.agent.clone() } else { m.map.clone() }).collect();
-                keys.sort();
-                keys.dedup();
-                egui::Grid::new(title).num_columns(4).spacing([24.0, 9.0]).striped(true).show(ui, |ui| {
-                    for h in ["", "Played", "Wins", "Win rate"] { ui.label(RichText::new(h).color(MUTED).strong()); }
-                    ui.end_row();
-                    for key in keys {
-                        let group: Vec<&&Match> = supported.iter().filter(|m| if by_agent { m.agent == key } else { m.map == key }).collect();
-                        let decided = group.iter().filter(|m| m.won.is_some()).count();
-                        let wins = group.iter().filter(|m| m.won == Some(true)).count();
-                        ui.label(&key);
-                        ui.label(group.len().to_string());
-                        ui.label(wins.to_string());
-                        ui.label(if decided > 0 { format!("{:.0}%", wins as f64 * 100.0 / decided as f64) } else { "N/A".to_string() });
-                        ui.end_row();
-                    }
-                });
-            });
-            ui.add_space(16.0);
+        if supported.is_empty() {
+            ui.label("No supported matches to analyze yet.");
+            return;
         }
-        ui.label(RichText::new("Small samples can be misleading. Match count is shown for context.").color(MUTED).size(11.0));
+        let decided = supported.iter().filter(|m| m.won.is_some()).count();
+        let won = supported.iter().filter(|m| m.won == Some(true)).count();
+        let agents = supported.iter().map(|m| m.agent.as_str()).collect::<std::collections::HashSet<_>>().len();
+        let maps = supported.iter().map(|m| m.map.as_str()).collect::<std::collections::HashSet<_>>().len();
+        ui.horizontal_wrapped(|ui| {
+            metric(ui, "Matches", &supported.len().to_string(), "Round-based modes");
+            metric(ui, "Win rate", &if decided > 0 { format!("{:.0}%", 100.0 * won as f64 / decided as f64) } else { "N/A".to_owned() }, "Known outcomes");
+            metric(ui, "Agents played", &agents.to_string(), "Unique agents");
+            metric(ui, "Maps played", &maps.to_string(), "Unique maps");
+        });
+        ui.add_space(18.0);
+        // Avoid the enormous empty right-hand side of the old tiny tables.
+        if ui.available_width() >= 850.0 {
+            ui.columns(2, |cols| {
+                breakdown_panel(&mut cols[0], &supported, true);
+                breakdown_panel(&mut cols[1], &supported, false);
+            });
+        } else {
+            breakdown_panel(ui, &supported, true);
+            ui.add_space(14.0);
+            breakdown_panel(ui, &supported, false);
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Only matches with known results contribute to win-rate percentages. Single-game 100% win rates are not meaningful evidence of a strong agent or map.").color(MUTED).size(11.0));
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
