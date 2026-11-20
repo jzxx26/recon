@@ -149,6 +149,10 @@ fn db() -> Result<Connection, String> {
                 headshots INTEGER NOT NULL,
                 bodyshots INTEGER NOT NULL,
                 legshots INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS match_details (
+                 match_id TEXT PRIMARY KEY,
+                 payload_json TEXT NOT NULL
              );",
         )
         .map_err(|e| e.to_string())?;
@@ -200,6 +204,56 @@ fn persist_matches(matches: &[Match]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())
+}
+
+// Keep the original, richer HenrikDev v3 payload for round-by-round
+// detail screens. No additional API call is needed to view cached games.
+fn persist_match_details(payload: &Value) -> Result<(), String> {
+    let Some(games) = payload.get("data").and_then(Value::as_array) else { return Ok(()); };
+    let mut connection = db()?;
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    for game in games {
+        let Some(id) = game.pointer("/metadata/matchid").and_then(Value::as_str) else { continue; };
+        let raw = serde_json::to_string(game).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO match_details(match_id,payload_json) VALUES (?1,?2)",
+            params![id, raw],
+        ).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn load_match_detail(id: &str) -> Option<Value> {
+    let connection = db().ok()?;
+    let raw: String = connection.query_row(
+        "SELECT payload_json FROM match_details WHERE match_id=?1",
+        params![id], |row| row.get(0),
+    ).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn score_for(game: &Value, team: &str) -> Option<i64> {
+    game.pointer(&format!("/teams/{}/rounds_won", team.to_ascii_lowercase()))
+        .and_then(Value::as_i64)
+        .or_else(|| game.pointer(&format!("/teams/{}/rounds_won", team)).and_then(Value::as_i64))
+}
+
+fn player_side(game: &Value, name: &str, tag: &str) -> Option<String> {
+    game.pointer("/players/all_players")?.as_array()?.iter().find(|p| {
+        p.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(name))
+            && p.get("tag").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case(tag))
+    })?.get("team")?.as_str().map(|s| s.to_ascii_lowercase())
+}
+
+fn round_winners(game: &Value, team: &str) -> Vec<Option<bool>> {
+    let Some(rounds) = game.get("rounds").and_then(Value::as_array) else { return vec![] };
+    rounds.iter().map(|round| {
+        round.get("winning_team").and_then(Value::as_str).and_then(|winner| {
+            if winner.eq_ignore_ascii_case("red") || winner.eq_ignore_ascii_case("blue") {
+                Some(winner.eq_ignore_ascii_case(team))
+            } else { None }
+        })
+    }).collect()
 }
 
 fn get_str<'a>(value: &'a Value, pointer: &str) -> &'a str {
@@ -322,6 +376,7 @@ fn fetch_matches(settings: &Settings, key: &str) -> Result<Vec<Match>, String> {
         return Err("HenrikDev returned no recent match list; API response may have changed.".into());
     }
     let target = settings.sync_count.clamp(5, 50);
+    persist_match_details(&payload)?;
     let mut matches = parse_matches(&payload, settings);
     let mut ids: std::collections::HashSet<String> = matches.iter().map(|m| m.id.clone()).collect();
 
@@ -542,36 +597,106 @@ impl Recon {
                 self.selected = None;
                 return;
             }
-            ui.add_space(12.0);
-            heading(ui, &format!("{}  /  {}", m.map, m.agent), &format!("{} · Match summary", m.mode));
+            ui.add_space(10.0);
+            heading(ui, &format!("{}  /  {}", m.map, m.agent), &format!("{} · Personal match breakdown", m.mode));
             let (outcome, color) = outcome_label(m.won);
-            ui.colored_label(color, RichText::new(outcome).strong().size(15.0));
+            let detail = load_match_detail(&m.id);
+            let timestamp = chrono::DateTime::from_timestamp(m.played_at, 0)
+                .map(|dt| dt.format("%d %b %Y · %H:%M UTC").to_string())
+                .unwrap_or_else(|| "Date unavailable".into());
+            egui::Frame::new().fill(PANEL).corner_radius(8.0)
+                .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(outcome).color(color).strong().size(18.0));
+                        ui.separator();
+                        ui.label(RichText::new(timestamp).color(MUTED).size(12.0));
+                        if let Some(game) = &detail {
+                            if let Some(side) = player_side(game, &self.settings.name, &self.settings.tag) {
+                                let opponent = if side == "red" { "blue" } else { "red" };
+                                if let (Some(ours), Some(theirs)) = (score_for(game, &side), score_for(game, opponent)) {
+                                    ui.separator();
+                                    ui.label(RichText::new(format!("{ours} : {theirs}")).color(WHITE).size(20.0).strong());
+                                }
+                            }
+                        }
+                    });
+                });
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                metric(ui, "Kills", &m.kills.to_string(), "This match");
+                metric(ui, "Kills", &m.kills.to_string(), "Eliminations");
                 metric(ui, "Deaths", &m.deaths.to_string(), "This match");
                 metric(ui, "Assists", &m.assists.to_string(), "This match");
-                if is_round_mode(&m.mode) && m.rounds > 0 {
-                    metric(ui, "ACS", &format!("{:.0}", m.acs()), "Round-based only");
+                metric(ui, "K/D", &format!("{:.2}", m.kills as f64 / m.deaths.max(1) as f64), "Kills per death");
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                if is_round_mode(&m.mode) && m.rounds > 0 && m.score > 0 {
+                    metric(ui, "ACS", &format!("{:.0}", m.acs()), "Score per round");
+                    metric(ui, "Rounds", &m.rounds.to_string(), "Match duration");
+                    metric(ui, "Kills / round", &format!("{:.2}", m.kills as f64 / m.rounds as f64), "Measured average");
                 }
+                let hs = m.hs_pct().map(|v| format!("{v:.1}%")).unwrap_or_else(|| "N/A".into());
+                metric(ui, "HS hit share", &hs, "Of recorded hits");
             });
             ui.add_space(14.0);
-            egui::Frame::new().fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-                ui.label(RichText::new("COMBAT BREAKDOWN").color(WHITE).strong());
-                ui.label(match m.hs_pct() {
-                    Some(v) => format!("Headshots as share of registered hits: {v:.1}%"),
-                    None => "Hit distribution unavailable".to_owned(),
+            egui::Frame::new().fill(PANEL).corner_radius(8.0)
+                .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    ui.label(RichText::new("HIT DISTRIBUTION").color(WHITE).strong());
+                    let total = m.headshots + m.bodyshots + m.legshots;
+                    if total > 0 {
+                        let available_width = (ui.available_width() - 4.0).max(80.0);
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, 13.0), egui::Sense::hover());
+                        let mut left = rect.left();
+                        for (count, col) in [(m.headshots, RED), (m.bodyshots, GREEN), (m.legshots, MUTED)] {
+                            let width = available_width * (count as f32 / total as f32);
+                            if width > 0.0 {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(egui::pos2(left, rect.top()), egui::vec2(width, rect.height())),
+                                    2.0, col,
+                                );
+                            }
+                            left += width;
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Head: {} ({:.1}%)", m.headshots, 100.0 * m.headshots as f64 / total as f64));
+                            ui.label(format!("Body: {} ({:.1}%)", m.bodyshots, 100.0 * m.bodyshots as f64 / total as f64));
+                            ui.label(format!("Legs: {} ({:.1}%)", m.legshots, 100.0 * m.legshots as f64 / total as f64));
+                        });
+                    } else {
+                        ui.label(RichText::new("No hit-location information available for this match.").color(MUTED));
+                    }
+                    ui.label(RichText::new("Hit share is not the percentage of kills finished with headshots.").color(MUTED).size(10.0));
                 });
-                ui.label(format!("Head: {}  ·  Body: {}  ·  Legs: {}", m.headshots, m.bodyshots, m.legshots));
-                if is_round_mode(&m.mode) && m.rounds > 0 {
-                    ui.label(format!("Rounds played: {}", m.rounds));
-                } else {
-                    ui.label(RichText::new("ACS is not calculated for this mode.").color(MUTED));
-                }
-                ui.separator();
-                ui.label(RichText::new("Round-by-round analysis will come with richer match data.").color(MUTED));
-                ui.label(RichText::new(format!("Match ID: {}", m.id)).color(MUTED).size(10.0));
-            });
+            ui.add_space(14.0);
+            egui::Frame::new().fill(PANEL).corner_radius(8.0)
+                .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                    ui.label(RichText::new("ROUND TIMELINE").color(WHITE).strong());
+                    match detail.as_ref().and_then(|game| {
+                        player_side(game, &self.settings.name, &self.settings.tag)
+                            .map(|side| round_winners(game, &side))
+                    }) {
+                        Some(winners) if !winners.is_empty() => {
+                            ui.label(RichText::new("Your team won (green) or lost (red) each round.").color(MUTED).size(11.0));
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, winner) in winners.iter().enumerate() {
+                                    let (label, color) = match winner {
+                                        Some(true) => ("W", GREEN),
+                                        Some(false) => ("L", RED),
+                                        None => ("?", MUTED),
+                                    };
+                                    ui.label(RichText::new(format!("{} {}", index + 1, label)).color(color).strong().size(12.0));
+                                }
+                            });
+                            let victories = winners.iter().filter(|w| **w == Some(true)).count();
+                            let defeats = winners.iter().filter(|w| **w == Some(false)).count();
+                            ui.label(RichText::new(format!("{} rounds won · {} rounds lost", victories, defeats)).color(MUTED));
+                        }
+                        _ => ui.label(RichText::new("Round data is unavailable for this cached match. New recent-match syncs may provide it; lifetime history is more limited.").color(MUTED)),
+                    };
+                });
+            ui.add_space(14.0);
+            ui.label(RichText::new("This report describes recorded outcomes, not positioning or crosshair mistakes. Video analysis will be a separate feature.").color(MUTED).size(11.0));
+            ui.label(RichText::new(format!("Match ID: {}", m.id)).color(MUTED).size(10.0));
             return;
         }
         heading(ui, "Match history", "Browse cached results and inspect individual matches");
@@ -816,6 +941,16 @@ mod tests {
         assert_eq!(matches[0].id, "test-1");
         assert_eq!(matches[0].won, Some(true));
         assert_eq!(matches[0].rounds, 23);
+    }
+
+    #[test]
+    fn round_results_are_derived_from_actual_winners() {
+        let game = serde_json::json!({"rounds":[
+            {"winning_team":"Red"},
+            {"winning_team":"Blue"},
+            {"winning_team":"Unknown"}
+        ]});
+        assert_eq!(round_winners(&game, "red"), vec![Some(true), Some(false), None]);
     }
 
 }
