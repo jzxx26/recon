@@ -691,7 +691,7 @@ impl Recon {
                             let defeats = winners.iter().filter(|w| **w == Some(false)).count();
                             ui.label(RichText::new(format!("{} rounds won · {} rounds lost", victories, defeats)).color(MUTED));
                         }
-                        _ => ui.label(RichText::new("Round data is unavailable for this cached match. New recent-match syncs may provide it; lifetime history is more limited.").color(MUTED)),
+                        _ => { ui.label(RichText::new("Round data is unavailable for this cached match. New recent-match syncs may provide it; lifetime history is more limited.").color(MUTED)); },
                     };
                 });
             ui.add_space(14.0);
