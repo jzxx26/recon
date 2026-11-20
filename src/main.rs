@@ -350,7 +350,7 @@ impl Recon {
         let points: Vec<[f64; 2]> = self.matches.iter().rev().enumerate()
             .map(|(idx, m)| [idx as f64, m.acs()]).collect();
         egui_plot::Plot::new("acs_trend").height(200.0).show(ui, |plot| {
-            plot.line(egui_plot::Line::new("ACS", egui_plot::PlotPoints::from(points)));
+            plot.line(egui_plot::Line::new(egui_plot::PlotPoints::from(points)).name("ACS"));
         });
         ui.label("ACS calculated as player score / rounds. Win rate excludes matches with unknown outcome.");
     }
