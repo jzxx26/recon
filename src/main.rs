@@ -412,7 +412,7 @@ impl Recon {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("RECENT MATCHES").color(WHITE).strong());
-            if ui.button("View all  →").clicked() { self.page = Page::Matches; }
+            if ui.button("View all").clicked() { self.page = Page::Matches; }
         });
         let recents: Vec<Match> = self.matches.iter().take(5).cloned().collect();
         for m in &recents { self.match_card(ui, m); }
@@ -420,40 +420,57 @@ impl Recon {
 
     fn match_card(&mut self, ui: &mut egui::Ui, m: &Match) {
         let (result, accent) = outcome_label(m.won);
-        egui::Frame::new().fill(PANEL).corner_radius(7.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 72.0),
+            egui::Sense::click(),
+        );
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let fill = if response.hovered() { ELEVATED } else { PANEL };
+        ui.painter().rect_filled(rect, 7.0, fill);
+        // Draw our own result indicator rather than relying on missing glyphs.
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 12.0, rect.top() + 16.0),
+                egui::vec2(3.0, 40.0),
+            ),
+            1.5,
+            accent,
+        );
+        ui.allocate_ui_at_rect(rect.shrink2(egui::vec2(24.0, 10.0)), |ui| {
             ui.horizontal(|ui| {
-                ui.colored_label(accent, "▌");
                 ui.vertical(|ui| {
+                    ui.set_min_width(115.0);
                     ui.label(RichText::new(&m.map).size(15.0).color(WHITE).strong());
                     ui.label(RichText::new(format!("{} · {}", m.agent, m.mode)).size(11.0).color(MUTED));
                 });
-                ui.add_space(18.0);
+                ui.add_space(16.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new(format!("{}/{}/{}", m.kills, m.deaths, m.assists)).size(15.0).color(WHITE));
                     ui.label(RichText::new("K / D / A").size(10.0).color(MUTED));
                 });
                 if is_round_mode(&m.mode) && m.rounds > 0 {
-                    ui.add_space(14.0);
+                    ui.add_space(16.0);
                     ui.vertical(|ui| {
                         ui.label(RichText::new(format!("{:.0}", m.acs())).size(15.0).color(WHITE));
                         ui.label(RichText::new("ACS").size(10.0).color(MUTED));
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Details →").clicked() {
-                        self.selected = Some(m.id.clone());
-                        self.page = Page::Matches;
-                    }
+                    ui.label(RichText::new("View").color(MUTED).size(11.0));
                     ui.label(RichText::new(result).color(accent).strong().size(11.0));
                 });
             });
         });
-        ui.add_space(4.0);
+        if response.clicked() {
+            self.selected = Some(m.id.clone());
+            self.page = Page::Matches;
+        }
+        ui.add_space(6.0);
     }
 
     fn match_list(&mut self, ui: &mut egui::Ui) {
         if let Some(m) = self.matches.iter().find(|m| Some(m.id.as_str()) == self.selected.as_deref()).cloned() {
-            if ui.button("←  Back to matches").clicked() {
+            if ui.button("Back to matches").clicked() {
                 self.selected = None;
                 return;
             }
@@ -666,7 +683,7 @@ impl eframe::App for Recon {
                     ui.label(RichText::new(format!("{}#{}", self.settings.name, self.settings.tag)).color(WHITE).strong());
                     ui.label(RichText::new(format!(" · {}", self.settings.region.to_uppercase())).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(self.worker.is_none(), egui::Button::new("↻  Sync matches")).clicked() {
+                        if ui.add_enabled(self.worker.is_none(), egui::Button::new("Sync matches")).clicked() {
                             self.sync();
                         }
                     });
