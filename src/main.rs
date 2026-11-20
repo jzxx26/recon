@@ -63,7 +63,11 @@ struct Settings {
     name: String,
     tag: String,
     region: String,
+    #[serde(default = "default_sync_count")]
+    sync_count: usize,
 }
+
+fn default_sync_count() -> usize { 10 }
 
 #[derive(Clone, Debug)]
 struct Match {
@@ -114,6 +118,7 @@ fn load_settings() -> Settings {
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| Settings {
             region: "ap".into(),
+            sync_count: default_sync_count(),
             ..Settings::default()
         })
 }
@@ -265,7 +270,7 @@ fn fetch_matches(settings: &Settings, key: &str) -> Result<Vec<Match>, String> {
     let response = client
         .get(url)
         .header("Authorization", key)
-        .query(&[("size", "10")])
+        .query(&[("size", settings.sync_count.clamp(5, 50).to_string())])
         .send()
         .map_err(|e| format!("Network request failed: {e}"))?;
     let status = response.status();
@@ -447,6 +452,43 @@ impl Recon {
     }
 
     fn match_list(&mut self, ui: &mut egui::Ui) {
+        if let Some(m) = self.matches.iter().find(|m| Some(m.id.as_str()) == self.selected.as_deref()).cloned() {
+            if ui.button("←  Back to matches").clicked() {
+                self.selected = None;
+                return;
+            }
+            ui.add_space(12.0);
+            heading(ui, &format!("{}  /  {}", m.map, m.agent), &format!("{} · Match summary", m.mode));
+            let (outcome, color) = outcome_label(m.won);
+            ui.colored_label(color, RichText::new(outcome).strong().size(15.0));
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                metric(ui, "Kills", &m.kills.to_string(), "This match");
+                metric(ui, "Deaths", &m.deaths.to_string(), "This match");
+                metric(ui, "Assists", &m.assists.to_string(), "This match");
+                if is_round_mode(&m.mode) && m.rounds > 0 {
+                    metric(ui, "ACS", &format!("{:.0}", m.acs()), "Round-based only");
+                }
+            });
+            ui.add_space(14.0);
+            egui::Frame::new().fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                ui.label(RichText::new("COMBAT BREAKDOWN").color(WHITE).strong());
+                ui.label(match m.hs_pct() {
+                    Some(v) => format!("Headshots as share of registered hits: {v:.1}%"),
+                    None => "Hit distribution unavailable".to_owned(),
+                });
+                ui.label(format!("Head: {}  ·  Body: {}  ·  Legs: {}", m.headshots, m.bodyshots, m.legshots));
+                if is_round_mode(&m.mode) && m.rounds > 0 {
+                    ui.label(format!("Rounds played: {}", m.rounds));
+                } else {
+                    ui.label(RichText::new("ACS is not calculated for this mode.").color(MUTED));
+                }
+                ui.separator();
+                ui.label(RichText::new("Round-by-round analysis will come with richer match data.").color(MUTED));
+                ui.label(RichText::new(format!("Match ID: {}", m.id)).color(MUTED).size(10.0));
+            });
+            return;
+        }
         heading(ui, "Match history", "Browse cached results and inspect individual matches");
         ui.horizontal_wrapped(|ui| {
             ui.label("Mode");
@@ -472,25 +514,7 @@ impl Recon {
             if visible.is_empty() { ui.label("No matches match these filters."); }
             for m in &visible { self.match_card(ui, m); }
         });
-        if let Some(m) = self.matches.iter().find(|m| Some(m.id.as_str()) == self.selected.as_deref()).cloned() {
-            let mut open = true;
-            egui::Window::new(format!("{} · {}", m.map, m.agent)).open(&mut open)
-                .default_width(380.0).resizable(true).show(ui.ctx(), |ui| {
-                    let (result, color) = outcome_label(m.won);
-                    ui.colored_label(color, result);
-                    ui.label(format!("Mode: {}", m.mode));
-                    ui.label(format!("K / D / A: {} / {} / {}", m.kills, m.deaths, m.assists));
-                    if is_round_mode(&m.mode) && m.rounds > 0 {
-                        ui.label(format!("ACS: {:.1}", m.acs()));
-                        ui.label(format!("Rounds: {}", m.rounds));
-                    } else { ui.label("Round-based ACS is not applicable for this mode."); }
-                    ui.label(match m.hs_pct() { Some(v) => format!("Headshot share of registered hits: {v:.1}%"), None => "Hit distribution unavailable".to_owned() });
-                    ui.separator();
-                    ui.label(RichText::new("Detailed round timelines require additional data and are not part of this UI iteration.").color(MUTED));
-                    ui.label(RichText::new(format!("Match ID: {}", m.id)).color(MUTED).size(10.0));
-                });
-            if !open { self.selected = None; }
-        }
+
     }
 
     fn analytics_ui(&mut self, ui: &mut egui::Ui) {
@@ -547,6 +571,21 @@ impl Recon {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
+            ui.label(RichText::new("MATCH SYNC").color(WHITE).strong());
+            ui.horizontal(|ui| {
+                ui.label("Request last");
+                egui::ComboBox::from_id_salt("sync_count")
+                    .selected_text(format!("{} matches", self.settings.sync_count))
+                    .show_ui(ui, |ui| {
+                        for count in [5_usize, 10, 20, 50] {
+                            ui.selectable_value(&mut self.settings.sync_count, count, format!("{count} matches"));
+                        }
+                    });
+            });
+            ui.label(RichText::new("The provider may return fewer than requested. Existing matches remain cached.").color(MUTED).size(11.0));
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
             ui.label(RichText::new("HENRIKDEV API KEY").color(WHITE).strong());
             ui.label(RichText::new("Saved to your OS credential store. Leaving the field blank preserves the existing key.").color(MUTED).size(11.0));
             ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).hint_text("Enter new API key").desired_width(360.0));
@@ -572,7 +611,7 @@ impl eframe::App for Recon {
                                 Ok(matches) => self.matches = matches,
                                 Err(e) => return self.status = format!("Reload failed: {e}"),
                             }
-                            format!("Synced {count} recent matches.")
+                            if count < self.settings.sync_count { format!("Synced {count} match(es); requested {}. Provider may limit available history.", self.settings.sync_count) } else { format!("Synced {count} recent matches.") }
                         }
                         Err(e) => e,
                     };
@@ -665,7 +704,7 @@ mod tests {
     use super::*;
     #[test]
     fn parses_empty_api_data() {
-        let settings = Settings { name: "Me".into(), tag: "TAG".into(), region: "ap".into() };
+        let settings = Settings { name: "Me".into(), tag: "TAG".into(), region: "ap".into(), sync_count: 10 };
         assert!(parse_matches(&serde_json::json!({"data": []}), &settings).is_empty());
     }
     #[test]
