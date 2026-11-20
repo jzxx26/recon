@@ -675,7 +675,7 @@ impl Recon {
             ui.label(RichText::new("RECENT MATCHES").color(WHITE).strong());
             if ui.button("View all").clicked() { self.page = Page::Matches; }
         });
-        let recents: Vec<Match> = games.iter().take(5).map(|m| (*m).clone()).collect();
+        let recents: Vec<Match> = games.iter().take(5).map(|m| (**m).clone()).collect();
         for m in &recents { self.match_card(ui, m); }
         ui.label(RichText::new("Statistics reflect locally cached matches only, not your entire VALORANT career.").color(MUTED).size(10.0));
     }
