@@ -256,32 +256,100 @@ fn parse_matches(payload: &Value, settings: &Settings) -> Vec<Match> {
         .collect()
 }
 
+// HenrikDev's v3 endpoint is intentionally limited to ten full matches.
+// Older history comes from the paginated, compact lifetime endpoint. It only
+// contains games already indexed by HenrikDev, so requesting N does not
+// guarantee that N exist.
+fn parse_lifetime_matches(payload: &Value) -> Vec<Match> {
+    let Some(items) = payload.get("data").and_then(Value::as_array) else {
+        return vec![];
+    };
+    items.iter().filter_map(|entry| {
+        let meta = entry.get("meta")?;
+        let stats = entry.get("stats")?;
+        let id = meta.get("id")?.as_str()?.trim();
+        let started_at = meta.get("started_at")?.as_str()?;
+        let played_at = chrono::DateTime::parse_from_rfc3339(started_at).ok()?.timestamp();
+        let map = meta.pointer("/map/name")?.as_str()?;
+        let agent = stats.pointer("/character/name")?.as_str()?;
+        let kills = stats.get("kills")?.as_i64()?;
+        let deaths = stats.get("deaths")?.as_i64()?;
+        let assists = stats.get("assists")?.as_i64()?;
+        let mode = meta.get("mode").and_then(Value::as_str).unwrap_or("Unknown");
+        let score = stats.get("score").and_then(Value::as_i64).unwrap_or(0);
+        let shots = stats.get("shots");
+        let side = stats.get("team").and_then(Value::as_str).unwrap_or("");
+        let team = entry.get("teams");
+        let red = team.and_then(|v| v.get("red")).and_then(Value::as_i64);
+        let blue = team.and_then(|v| v.get("blue")).and_then(Value::as_i64);
+        let rounds = red.zip(blue).map(|(r,b)| r+b).unwrap_or(0);
+        let won = match (side.to_ascii_lowercase().as_str(), red, blue) {
+            ("red", Some(r), Some(b)) if r != b => Some(r > b),
+            ("blue", Some(r), Some(b)) if r != b => Some(b > r),
+            _ => None,
+        };
+        if id.is_empty() || played_at <= 0 { return None; }
+        Some(Match {
+            id: id.into(), map: map.into(), agent: agent.into(),
+            mode: mode.into(), played_at, kills, deaths, assists, score,
+            rounds, won,
+            headshots: shots.and_then(|v| v.get("head")).and_then(Value::as_i64).unwrap_or(0),
+            bodyshots: shots.and_then(|v| v.get("body")).and_then(Value::as_i64).unwrap_or(0),
+            legshots: shots.and_then(|v| v.get("leg")).and_then(Value::as_i64).unwrap_or(0),
+        })
+    }).collect()
+}
+
 fn fetch_matches(settings: &Settings, key: &str) -> Result<Vec<Match>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(25))
         .build()
         .map_err(|e| e.to_string())?;
-    let url = format!(
-        "https://api.henrikdev.xyz/valorant/v3/matches/{}/{}/{}",
-        urlencoding::encode(settings.region.trim()),
-        urlencoding::encode(settings.name.trim()),
-        urlencoding::encode(settings.tag.trim())
-    );
-    let response = client
-        .get(url)
-        .header("Authorization", key)
-        .query(&[("size", settings.sync_count.clamp(5, 50).to_string())])
-        .send()
-        .map_err(|e| format!("Network request failed: {e}"))?;
+    let region = urlencoding::encode(settings.region.trim());
+    let name = urlencoding::encode(settings.name.trim());
+    let tag = urlencoding::encode(settings.tag.trim());
+    let url = format!("https://api.henrikdev.xyz/valorant/v3/matches/{region}/{name}/{tag}");
+    // This is the provider's maximum for full match details.
+    let response = client.get(url).header("Authorization", key)
+        .query(&[("size", "10")]).send()
+        .map_err(|e| format!("Recent match fetch failed: {e}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("HenrikDev returned HTTP {status}. Check your key, Riot ID, region and API limits."));
+        return Err(format!("HenrikDev recent matches returned HTTP {status}. Check credentials, region and rate limits."));
     }
-    let payload: Value = response.json().map_err(|e| format!("Invalid API response: {e}"))?;
-    if payload.get("data").and_then(Value::as_array).is_none() {
-        return Err("HenrikDev returned no match list; endpoint or response format may have changed.".into());
+    let payload: Value = response.json().map_err(|e| format!("Invalid recent-match response: {e}"))?;
+    if !payload.get("data").is_some_and(Value::is_array) {
+        return Err("HenrikDev returned no recent match list; API response may have changed.".into());
     }
-    Ok(parse_matches(&payload, settings))
+    let target = settings.sync_count.clamp(5, 50);
+    let mut matches = parse_matches(&payload, settings);
+    let mut ids: std::collections::HashSet<String> = matches.iter().map(|m| m.id.clone()).collect();
+
+    if target > matches.len() {
+        // Lifetime data is indexed by the provider, and may be incomplete. We
+        // fetch sequentially to stay well under a Basic key's rate limit.
+        let history_url = format!(
+            "https://api.henrikdev.xyz/valorant/v1/lifetime/matches/{region}/{name}/{tag}"
+        );
+        for page in 1..=5 {
+            let response = match client.get(&history_url).header("Authorization", key)
+                .query(&[("page", page.to_string()), ("size", "50".to_owned())]).send() {
+                    Ok(response) if response.status().is_success() => response,
+                    _ => break, // Keep the successfully retrieved recent matches.
+                };
+            let Ok(payload) = response.json::<Value>() else { break };
+            let history = parse_lifetime_matches(&payload);
+            if history.is_empty() { break; }
+            let page_len = history.len();
+            for m in history {
+                if ids.insert(m.id.clone()) { matches.push(m); }
+            }
+            if matches.len() >= target || page_len < 50 { break; }
+        }
+    }
+    matches.sort_by(|a,b| b.played_at.cmp(&a.played_at));
+    matches.truncate(target);
+    Ok(matches)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -599,7 +667,7 @@ impl Recon {
                         }
                     });
             });
-            ui.label(RichText::new("The provider may return fewer than requested. Existing matches remain cached.").color(MUTED).size(11.0));
+            ui.label(RichText::new("Recent detail is limited to 10; larger syncs use cached lifetime history and may have gaps.").color(MUTED).size(11.0));
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
@@ -735,4 +803,19 @@ mod tests {
         assert_eq!(m.acs(), 300.0);
         assert_eq!(m.hs_pct(), Some(20.0));
     }
+    #[test]
+    fn parses_lifetime_history() {
+        let payload = serde_json::json!({"data":[{
+            "meta":{"id":"test-1","map":{"name":"Ascent"},"mode":"Competitive","started_at":"2026-11-20T12:00:00Z"},
+            "stats":{"character":{"name":"Clove"},"team":"Red","kills":17,"deaths":14,"assists":5,"score":4200,
+                     "shots":{"head":13,"body":37,"leg":1}},
+            "teams":{"red":13,"blue":10}
+        }]});
+        let matches = parse_lifetime_matches(&payload);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "test-1");
+        assert_eq!(matches[0].won, Some(true));
+        assert_eq!(matches[0].rounds, 23);
+    }
+
 }
