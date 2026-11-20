@@ -10,6 +10,10 @@ Open [Actions](../../actions/workflows/windows.yml), select the latest successfu
 
 GitHub requires sign-in to download workflow artifacts. If the build is still running or failed, no executable is available yet.
 
+## Signing and Windows Smart App Control
+
+RECON builds are currently **unsigned**. Smart App Control may block them. The workflow publishes a SHA-256 checksum for artifact integrity, not a trusted publisher identity. See [Code signing policy](CODE_SIGNING.md) for the plan to seek free trusted signing through SignPath Foundation. Do not disable system-wide protections solely to run RECON.
+
 ## Setup
 
 1. Open RECON and select **Settings**.
