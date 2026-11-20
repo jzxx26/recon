@@ -449,6 +449,9 @@ enum Page {
     Settings,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum OverviewChart { Acs, Kd }
+
 struct Recon {
     page: Page,
     settings: Settings,
@@ -458,6 +461,8 @@ struct Recon {
     mode_filter: String,
     search: String,
     sidebar_collapsed: bool,
+    overview_mode: String,
+    overview_chart: OverviewChart,
     worker: Option<Receiver<Result<usize, String>>>,
     status: String,
 }
@@ -478,6 +483,8 @@ impl Recon {
             mode_filter: "All".into(),
             search: String::new(),
             sidebar_collapsed: false,
+            overview_mode: "All".into(),
+            overview_chart: OverviewChart::Acs,
             worker: None,
             status,
         }
@@ -534,45 +541,143 @@ impl Recon {
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "Overview", "Your recent match performance, stored locally");
+        heading(ui, "Overview", "Your performance at a glance · cached matches");
         if self.matches.is_empty() {
             ui.label("No matches saved yet. Add your Riot ID and API key in Settings, then sync.");
             if ui.button("Open Settings").clicked() { self.page = Page::Settings; }
             return;
         }
-        let round_matches: Vec<&Match> = self.matches.iter().filter(|m| is_round_mode(&m.mode)).collect();
-        let wins = round_matches.iter().filter(|m| m.won == Some(true)).count();
-        let decided = round_matches.iter().filter(|m| m.won.is_some()).count();
-        let kills: i64 = round_matches.iter().map(|m| m.kills).sum();
-        let deaths: i64 = round_matches.iter().map(|m| m.deaths).sum();
-        let scored: i64 = round_matches.iter().map(|m| m.score).sum();
-        let rounds: i64 = round_matches.iter().map(|m| m.rounds).sum();
-        ui.horizontal_wrapped(|ui| {
-            metric(ui, "Match wins", &format!("{wins} / {decided}"), "Round-based modes");
-            metric(ui, "Win rate", &if decided == 0 { "N/A".into() } else {format!("{:.0}%", 100.0 * wins as f64 / decided as f64)}, "Completed matches");
-            metric(ui, "K / D", &format!("{:.2}", kills as f64 / deaths.max(1) as f64), "All round-based matches");
-            metric(ui, "Average ACS", &if rounds == 0 { "N/A".into() } else {format!("{:.0}", scored as f64 / rounds as f64)}, "Weighted by rounds");
-        });
-        ui.add_space(16.0);
-        egui::Frame::new().fill(PANEL).corner_radius(9.0).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-            ui.label(RichText::new("ACS TREND").color(WHITE).strong());
-            ui.label(RichText::new("Chronological · round-based modes only").color(MUTED).size(11.0));
-            let points: Vec<[f64; 2]> = round_matches.iter().rev().filter(|m| m.rounds > 0)
-                .enumerate().map(|(idx, m)| [idx as f64, m.acs()]).collect();
-            if points.is_empty() { ui.label("No supported round-based matches."); }
-            else {
-                egui_plot::Plot::new("acs_dashboard").height(190.0).show(ui, |plot| {
-                    plot.line(egui_plot::Line::new(egui_plot::PlotPoints::from(points)).name("ACS").color(RED).width(2.5));
-                });
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("GAME MODE").color(MUTED).size(11.0));
+            for mode in ["All", "Competitive", "Unrated"] {
+                let chosen = self.overview_mode == mode;
+                if ui.add(egui::Button::new(RichText::new(mode).color(if chosen { WHITE } else { MUTED }))
+                    .fill(if chosen { ELEVATED } else { PANEL })).clicked() {
+                    self.overview_mode = mode.to_owned();
+                }
             }
         });
+        ui.add_space(8.0);
+        let games: Vec<&Match> = self.matches.iter()
+            .filter(|m| is_round_mode(&m.mode)
+                && (self.overview_mode == "All" || m.mode.eq_ignore_ascii_case(&self.overview_mode)))
+            .collect();
+        if games.is_empty() {
+            ui.label("No matches in this mode yet.");
+            return;
+        }
+
+        let wins = games.iter().filter(|m| m.won == Some(true)).count();
+        let decided = games.iter().filter(|m| m.won.is_some()).count();
+        let kills: i64 = games.iter().map(|m| m.kills).sum();
+        let deaths: i64 = games.iter().map(|m| m.deaths).sum();
+        let scored: i64 = games.iter().filter(|m| m.score > 0 && m.rounds > 0).map(|m| m.score).sum();
+        let rounds: i64 = games.iter().filter(|m| m.score > 0 && m.rounds > 0).map(|m| m.rounds).sum();
+        ui.horizontal_wrapped(|ui| {
+            metric(ui, "Matches", &games.len().to_string(), "Cached · filtered");
+            metric(ui, "Win rate",
+                &if decided > 0 {format!("{:.0}%", 100.0 * wins as f64 / decided as f64)} else {"N/A".into()},
+                &format!("{wins} wins / {decided} decided"));
+            metric(ui, "K/D ratio", &if deaths > 0 {format!("{:.2}", kills as f64 / deaths as f64)} else {"N/A".into()},
+                &format!("{kills} kills / {deaths} deaths"));
+            metric(ui, "Average ACS", &if rounds > 0 {format!("{:.0}", scored as f64 / rounds as f64)} else {"N/A".into()},
+                "Round-weighted · available scores");
+        });
+
         ui.add_space(16.0);
+        egui::Frame::new().fill(PANEL).corner_radius(9.0)
+            .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("RECENT RESULTS").color(WHITE).strong());
+                    ui.label(RichText::new("Oldest to newest · last 20 filtered matches").color(MUTED).size(11.0));
+                });
+                ui.add_space(5.0);
+                let results: Vec<&Match> = games.iter().take(20).copied().rev().collect();
+                ui.horizontal_wrapped(|ui| {
+                    for (index, m) in results.iter().enumerate() {
+                        let (label, color) = outcome_label(m.won);
+                        let short = if m.won == Some(true) { "W" } else if m.won == Some(false) { "L" } else { "?" };
+                        let response = ui.add_sized([31.0, 29.0],
+                            egui::Button::new(RichText::new(short).color(color).strong())
+                                .fill(ELEVATED));
+                        if response.clicked() {
+                            self.selected = Some(m.id.clone());
+                            self.page = Page::Matches;
+                        }
+                        response.on_hover_text(format!("{} · {} · {} · {}", index + 1, m.map, m.agent, label));
+                    }
+                });
+            });
+
+        ui.add_space(16.0);
+        egui::Frame::new().fill(PANEL).corner_radius(9.0)
+            .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                ui.label(RichText::new("PERFORMANCE TREND").color(WHITE).strong());
+                ui.label(RichText::new("Chronological · valid round-based matches only").color(MUTED).size(11.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.overview_chart, OverviewChart::Acs, "ACS");
+                    ui.selectable_value(&mut self.overview_chart, OverviewChart::Kd, "K/D");
+                });
+                let points: Vec<[f64; 2]> = games.iter().rev().filter_map(|m| {
+                    match self.overview_chart {
+                        OverviewChart::Acs if m.score > 0 && m.rounds > 0 => Some(m.acs()),
+                        OverviewChart::Kd if m.deaths > 0 => Some(m.kills as f64 / m.deaths as f64),
+                        _ => None,
+                    }
+                }).enumerate().map(|(i, v)| [i as f64 + 1.0, v]).collect();
+                if points.is_empty() {
+                    ui.label("No usable data for the selected trend.");
+                } else {
+                    egui_plot::Plot::new("overview_trend")
+                        .height(230.0)
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .show(ui, |plot| {
+                            plot.line(egui_plot::Line::new(egui_plot::PlotPoints::from(points))
+                                .name(match self.overview_chart { OverviewChart::Acs => "ACS", OverviewChart::Kd => "K/D" })
+                                .color(RED).width(2.5_f32));
+                        });
+                }
+            });
+
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("MOST PLAYED AGENTS").color(WHITE).strong());
+            if ui.button("Explore analytics").clicked() { self.page = Page::Analytics; }
+        });
+        let mut agents = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
+        for m in &games {
+            let item = agents.entry(m.agent.clone()).or_default();
+            item.0 += 1;
+            if m.won.is_some() { item.1 += 1; }
+            if m.won == Some(true) { item.2 += 1; }
+        }
+        let mut sorted: Vec<_> = agents.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        egui::Frame::new().fill(PANEL).corner_radius(8.0)
+            .inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+                for (agent, (played, decided, won)) in sorted.into_iter().take(3) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&agent).color(WHITE).strong());
+                        ui.label(RichText::new(format!("{played} played")).color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(if decided > 0 {
+                                format!("{:.0}% win rate", 100.0 * won as f64 / decided as f64)
+                            } else { "N/A".into() }).color(GREEN));
+                        });
+                    });
+                }
+            });
+
+        ui.add_space(18.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("RECENT MATCHES").color(WHITE).strong());
             if ui.button("View all").clicked() { self.page = Page::Matches; }
         });
-        let recents: Vec<Match> = self.matches.iter().take(5).cloned().collect();
+        let recents: Vec<Match> = games.iter().take(5).map(|m| (**m).clone()).collect();
         for m in &recents { self.match_card(ui, m); }
+        ui.label(RichText::new("Statistics reflect locally cached matches only, not your entire VALORANT career.").color(MUTED).size(10.0));
     }
 
     fn match_card(&mut self, ui: &mut egui::Ui, m: &Match) {
